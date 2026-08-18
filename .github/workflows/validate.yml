@@ -14,4 +14,4 @@ jobs:
         with:
           node-version: '22'
       - run: node bin/validate.mjs
-      - run: node --test test/
+      - run: node --test
