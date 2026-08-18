@@ -1,0 +1,7 @@
+{
+  "name": "architect-plugin",
+  "owner": { "name": "ishangupta-ds" },
+  "plugins": [
+    { "name": "architect", "source": "./" }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "architect",
+  "displayName": "Architect",
+  "version": "0.1.0",
+  "description": "Deterministically gates Claude Code plan mode against Architect (an architecture-decision copilot): before a plan can be proposed, it is submitted, checked against recorded decisions, and any unwaived violation blocks ExitPlanMode until resolved or explicitly waived.",
+  "author": { "name": "ishangupta-ds" },
+  "homepage": "https://github.com/ishangupta-ds/architect-plugin",
+  "repository": "https://github.com/ishangupta-ds/architect-plugin",
+  "license": "MIT",
+  "keywords": ["architecture", "decisions", "plan-mode", "governance"]
+}

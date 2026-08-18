@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "architect": {
+      "url": "${ARCHITECT_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ARCHITECT_TOKEN}"
+      }
+    }
+  }
+}
