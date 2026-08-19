@@ -60,3 +60,21 @@ and falls back to the session-scoped marker-file protocol
 otherwise — so correctness does not depend on knowing the answer in advance. This
 note should be updated (and the dead code path considered for removal) once a real
 session confirms which path is actually exercised in practice.
+
+## 4. `enforce-approvals` mode worst-case latency — computed, NOT yet measured in a real session
+
+`ARCHITECT_GATE=enforce-approvals` (added alongside the server's V11 wedge) adds up
+to two more network calls (`GET .../gate-status`, `POST .../reviews/request`, each
+a 5s `fetchGateStatus`/`requestReviewsAuto` timeout) on top of the base
+`submitAndCheck` path's three calls (`compile`/`check`/`waivers`, each an 8s
+`architectRequest` timeout). Worst case, every call individually times out before
+failing: `3 × 8s + 2 × 5s = 34s`. The `PreToolUse` hook's own budget is documented
+elsewhere in this repo as roughly 60s, so this leaves real margin (~26s) even at the
+theoretical worst case — but this is arithmetic on the configured timeouts, not a
+measurement against a real, possibly-slow-network Claude Code session. **Still open**:
+run a real `enforce-approvals` session against a live server and record the
+observed p50/p95 hook latency here, the same way finding #3 above needs a real
+session to resolve. If real-world latency ever gets uncomfortably close to the hook
+ceiling, the fix is almost certainly parallelizing `fetchGateStatus`'s eventual
+poll retries client-side (the plugin itself never long-polls; each `ExitPlanMode`
+retry is one fresh, fast round trip), not raising these per-call timeouts.

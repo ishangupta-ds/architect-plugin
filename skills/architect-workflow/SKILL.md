@@ -52,6 +52,27 @@ can skip — the hook denies `ExitPlanMode` outright when the check fails.
    you followed the loop, so there's no way to "forget" this step and have it slip
    through.
 
+7a. **If `ARCHITECT_GATE=enforce-approvals` is set**, a clean plan is not
+   automatically enough — the gate additionally requires a human reviewer to
+   approve it before `ExitPlanMode` is allowed through:
+   - A denial in this mode means the plan is clean but **awaiting reviewer
+     approval**. The gate has already auto-requested reviews on your behalf if
+     nothing was pending (you don't need to do this yourself). The deny reason
+     names the exact next step: poll `GET /api/plans/<planId>/gate-status?wait=25&since=<fingerprint>`
+     (or re-call `architect_get_gate_status`) until `reviewGate.satisfied` is
+     `true`, then retry `ExitPlanMode`.
+   - **Never approve your own plan.** The gate only auto-*requests* reviews; it
+     never resolves them. Waiting for a real human to approve is the entire
+     point of this mode — don't work around it by finding a way to self-approve.
+   - If the deny reason says no reviewers could be auto-derived (no
+     CODEOWNERS/decision/owner match found), **surface that to the user
+     directly** and ask who should review this plan, rather than guessing —
+     then send an explicit request yourself: `POST /api/plans/<planId>/reviews/request
+     {from: ["their-login"]}`.
+   - Against a server that predates this feature (`gate-status` 404s), the gate
+     allows through with an upgrade note instead of blocking — you don't need to
+     do anything differently there.
+
 ## Grounding your plan in recorded decisions
 
 Before drafting, it's worth calling `architect_get_baseline` to see the currently
@@ -75,6 +96,11 @@ a check report useful instead of generic.
   (e.g. a binder miss, or a decision that's actually stale), say that plainly to
   the user rather than silently working around it — the fix might be to the
   decision log or the binder, not the plan.
+- **Under `enforce-approvals`, never approve your own plan and never poll in a
+  tight loop.** Wait for the poll interval implied by `gate-status?wait=25` (one
+  request every ~25s at most) rather than hammering the endpoint, and treat an
+  `awaiting-approval` denial as "a human needs to act," not as a bug to route
+  around.
 
 ## If the gate isn't configured
 

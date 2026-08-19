@@ -3,7 +3,10 @@
 Deterministically gates Claude Code plan mode against
 [Architect](https://architect.intutic.ai), an architecture-decision copilot: before a
 plan can be proposed, it is submitted, checked against recorded decisions, and any
-unwaived violation blocks `ExitPlanMode` until resolved or explicitly waived. See
+unwaived violation blocks `ExitPlanMode` until resolved or explicitly waived. An
+optional `enforce-approvals` mode goes further, additionally requiring a human
+reviewer to approve the plan before `ExitPlanMode` is allowed through (see "Gate
+modes" below). See
 [ishangupta-ds/architect](https://github.com/ishangupta-ds/architect) for the server
 this plugin talks to.
 
@@ -26,8 +29,8 @@ blocked. There's no step for the model to skip.
    export ARCHITECT_TOKEN=architect_...
    ```
    Optional: `ARCHITECT_WORKSPACE=<workspace-id>` to target a non-default
-   workspace; `ARCHITECT_GATE=enforce|warn|off` to override the default (see
-   "Gate modes" below).
+   workspace; `ARCHITECT_GATE=enforce|warn|off|enforce-approvals` to override
+   the default (see "Gate modes" below).
 
 3. **Install the plugin**, inside a Claude Code session:
    ```
@@ -49,9 +52,13 @@ blocked. There's no step for the model to skip.
 | `off` | explicit opt-out | Never checks, never blocks. |
 | `warn` | default when `ARCHITECT_TOKEN` is unset | Checks when possible; never actually blocks `ExitPlanMode` — denials become informational reasons only. |
 | `enforce` | default once `ARCHITECT_TOKEN` is set | A real unwaived violation, an unreachable server, or a malformed plan denies `ExitPlanMode`. Server-side misconfiguration (no planner model, no code snapshot imported) still allows through — that's an operator problem, not a plan problem. |
+| `enforce-approvals` | always explicit opt-in, never a default | Everything `enforce` does, **plus**: a clean/waived plan additionally checks the server's live review-approval gate (`GET .../gate-status`) before allowing. If it isn't satisfied and nobody has an open review request yet, the gate auto-requests reviewers on your behalf (`POST .../reviews/request {auto:true}`) and denies with instructions to poll `gate-status?wait=25&since=<fingerprint>` until it's satisfied, then retry. Requires a V11+ Architect deployment — against an older server (`gate-status` 404s), it allows through with an upgrade note instead of blocking on a feature the server doesn't have. |
 
 Setting a token is what flips the default from `warn` to `enforce` — configuring
-the gate is treated as opting into it being real.
+the gate is treated as opting into it being real. `enforce-approvals` is never
+reached by default in either case — you must set `ARCHITECT_GATE=enforce-approvals`
+explicitly, since it changes the loop (a plan can now sit "awaiting approval" even
+with zero violations) in a way plain `enforce` never does.
 
 ## Repo layout
 
