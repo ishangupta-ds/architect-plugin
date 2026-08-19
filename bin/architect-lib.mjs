@@ -21,15 +21,19 @@ export async function readStdinJson() {
   }
 }
 
+const VALID_MODES = new Set(['off', 'warn', 'enforce', 'enforce-approvals']);
+
 /** ARCHITECT_GATE default: 'enforce' once a token is configured (setting a token
  * signals intent to use the gate for real), else 'warn' -- an unconfigured user
- * must never have plan mode silently bricked. */
+ * must never have plan mode silently bricked. 'enforce-approvals' (V11) is always
+ * an explicit opt-in -- it never becomes a default, only ARCHITECT_GATE=enforce-approvals
+ * selects it. */
 export function resolveConfig(env = process.env) {
   const url = (env.ARCHITECT_URL || '').replace(/\/$/, '');
   const token = env.ARCHITECT_TOKEN || '';
   const workspace = env.ARCHITECT_WORKSPACE || '';
   const explicitMode = env.ARCHITECT_GATE;
-  const mode = explicitMode === 'off' || explicitMode === 'warn' || explicitMode === 'enforce' ? explicitMode : token ? 'enforce' : 'warn';
+  const mode = VALID_MODES.has(explicitMode) ? explicitMode : token ? 'enforce' : 'warn';
   return { url, token, workspace, mode, configured: Boolean(url && token) };
 }
 
@@ -101,6 +105,13 @@ export async function submitAndCheck(config, { markdown, planId }) {
   } catch (err) {
     return { network: true, stage: 'waivers', error: err instanceof Error ? err.message : String(err) };
   }
+  // Bug fix (V11 plugin P1): a non-200 waivers response used to fall straight
+  // through to `waivers.json?.waivers ?? []`, silently reading as "nothing
+  // waived" -- turning a fully-waived plan into a false BLOCKED verdict instead
+  // of surfacing the real failure. Treat it the same as a non-200 compile/check
+  // response: short-circuit with the stage/status/json so the caller classifies
+  // and reports it honestly.
+  if (waivers.status !== 200) return { network: false, stage: 'waivers', status: waivers.status, json: waivers.json };
   const waivedIds = new Set((waivers.json?.waivers ?? []).map((w) => w.flagId));
 
   const verdict = computeVerdict(check.json?.report, check.json?.binderStats, waivedIds);
@@ -114,6 +125,100 @@ export function computeVerdict(report, binderStats, waivedIds = new Set()) {
   const advisories = flags.filter((f) => f.severity === 'advisory');
   const binderIncomplete = Boolean(binderStats && binderStats.bound < binderStats.total);
   return { blocked: violations.length > 0, violations, risks, advisories, binderIncomplete, binderStats };
+}
+
+// ---- V11 plugin Part P3: enforce-approvals mode ----
+//
+// After a clean/waived verdict, when (and only when) ARCHITECT_GATE=enforce-approvals,
+// the gate additionally consults the server's live review-approval gate (V11's
+// gate-status snapshot -- approval state changes server-side, so this is never
+// cached in the marker file the way the base verdict is). If the gate is
+// unsatisfied and nobody has an open request at the plan's current hash yet, the
+// gate auto-requests reviews on the caller's behalf before denying, so the human
+// loop (approve in the UI or via Slack) can actually start.
+
+/** GET .../gate-status, one-shot (no `wait` param -- this is a single poll, not a
+ * long-poll; the caller is expected to re-invoke ExitPlanMode later, which
+ * re-runs this check, rather than this script itself blocking). 5s timeout: the
+ * PreToolUse hook budget is ~60s total and this is one more network call layered
+ * on top of compile/check/waivers (each already up to 8s). */
+export async function fetchGateStatus(config, planId, timeoutMs = 5000) {
+  try {
+    return await architectRequest(config, 'GET', `/api/plans/${encodeURIComponent(planId)}/gate-status`, undefined, timeoutMs);
+  } catch (err) {
+    return { network: true, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** POST .../reviews/request {auto:true} -- lets the server derive stakeholders
+ * (CODEOWNERS/decisions/owner-fallback) rather than the plugin guessing logins. */
+export async function requestReviewsAuto(config, planId, timeoutMs = 5000) {
+  try {
+    return await architectRequest(config, 'POST', `/api/plans/${encodeURIComponent(planId)}/reviews/request`, { auto: true }, timeoutMs);
+  } catch (err) {
+    return { network: true, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Pure: turns a gate-status result (+ optional review-request outcome) into one
+ * of the four approval-gate states. No I/O, no fetch -- directly unit-testable
+ * against hand-built fixtures, same discipline as computeVerdict. */
+export function evaluateApprovalGate(gateStatusResult, requestOutcome) {
+  if (gateStatusResult.network) return { kind: 'network', detail: gateStatusResult.error };
+  // A 404 here means the plan itself is missing OR (far more likely in practice)
+  // this server predates V11 and has no /gate-status route at all -- both read
+  // as "can't tell you the approval state", which is an operator/deployment
+  // problem, not a reason to block a clean plan.
+  if (gateStatusResult.status === 404) return { kind: 'gate-status-unavailable' };
+  const snapshot = gateStatusResult.json;
+  if (gateStatusResult.status !== 200 || !snapshot?.reviewGate) {
+    return { kind: 'gate-status-unavailable', detail: `gate-status returned ${gateStatusResult.status}` };
+  }
+  if (snapshot.reviewGate.satisfied) return { kind: 'approved', snapshot };
+  if (requestOutcome?.noStakeholders) return { kind: 'awaiting-approval', snapshot, noStakeholders: true };
+  return { kind: 'awaiting-approval', snapshot, requested: Boolean(requestOutcome?.requested) };
+}
+
+/** Orchestrates the fetch(es) evaluateApprovalGate needs: always fetches
+ * gate-status; auto-requests reviews ONLY when the gate is unsatisfied AND
+ * nothing is already pending at the current hash (`openAtCurrentHash === 0`) --
+ * never re-requests on top of an existing open request. */
+export async function checkApprovalGate(config, planId) {
+  const gateStatusResult = await fetchGateStatus(config, planId);
+  const preliminary = evaluateApprovalGate(gateStatusResult);
+  if (preliminary.kind !== 'awaiting-approval' || preliminary.snapshot.reviewGate.openAtCurrentHash > 0) {
+    return preliminary;
+  }
+  const reqResult = await requestReviewsAuto(config, planId);
+  if (reqResult.network) return { kind: 'network', detail: reqResult.error };
+  let requestOutcome;
+  if (reqResult.status === 200) requestOutcome = { requested: true };
+  else if (reqResult.status === 409 && reqResult.json?.error === 'REVIEW_ALREADY_REQUESTED') {
+    // A request landed between our gate-status read and this POST (another
+    // session, another retry) -- that's success, not a failure: treat it as
+    // idempotent, exactly like the plan's own "409 = success" instruction.
+    requestOutcome = { requested: false };
+  } else if (reqResult.status === 409 && reqResult.json?.error === 'NO_STAKEHOLDERS_DERIVED') {
+    requestOutcome = { noStakeholders: true };
+  } else {
+    requestOutcome = { requested: false, error: `reviews/request returned ${reqResult.status}${reqResult.json?.error ? ` ${reqResult.json.error}` : ''}` };
+  }
+  return evaluateApprovalGate(gateStatusResult, requestOutcome);
+}
+
+/** The single allow/deny decision point (V11 plugin P2 -- previously duplicated
+ * inline in architect-gate.mjs's own classification table; moved here so it's
+ * one unit-testable function shared by every caller). `approved` and
+ * `gate-status-unavailable` always allow regardless of mode (the latter is an
+ * operator/version problem, never a reason to block a clean plan);
+ * `awaiting-approval` denies ONLY in `enforce-approvals` (plain `enforce` never
+ * even computes this kind, since the approval-gate check only runs when the mode
+ * is `enforce-approvals` -- see checkApprovalGate's caller in architect-gate.mjs). */
+export function decideAllow(mode, kind) {
+  if (kind === 'clean' || kind === 'server-unconfigured' || kind === 'approved' || kind === 'gate-status-unavailable') return true;
+  if (kind === 'awaiting-approval') return mode !== 'enforce-approvals';
+  if (mode !== 'enforce' && mode !== 'enforce-approvals') return true; // warn/off: never actually block
+  return false; // enforce/enforce-approvals + blocked/network/bad-plan/other-error: deny
 }
 
 /** The one place error-response classification happens -- shared between the gate
@@ -152,7 +257,33 @@ export function formatReason(config, planId, outcome) {
   if (outcome.kind === 'bad-plan') {
     return `Architect could not compile this plan (${outcome.detail}) -- revise the plan markdown and retry.`;
   }
-  return `Architect returned an unexpected error (${outcome.detail}) -- export ARCHITECT_GATE=warn to bypass while this is investigated.`;
+  // V11 plugin P3 (enforce-approvals mode) -- these three kinds are only ever
+  // produced when ARCHITECT_GATE=enforce-approvals; see checkApprovalGate.
+  if (outcome.kind === 'approved') {
+    const rg = outcome.snapshot.reviewGate;
+    return `Architect: 0 violations (planId ${planId}) and the review-approval gate is satisfied (${rg.have} approved, mode ${rg.mode}).`;
+  }
+  if (outcome.kind === 'gate-status-unavailable') {
+    const detail = outcome.detail ? ` (${outcome.detail})` : '';
+    return `Architect: plan is clean (planId ${planId}), but this server doesn't support the review-approval gate-status route yet${detail} -- likely a pre-V11 deployment. Allowing without an approval check; upgrade the server, or set ARCHITECT_GATE=enforce instead of enforce-approvals until then.`;
+  }
+  if (outcome.kind === 'awaiting-approval') {
+    const rg = outcome.snapshot.reviewGate;
+    const fingerprint = outcome.snapshot.fingerprint;
+    let statusNote;
+    if (outcome.noStakeholders) {
+      statusNote = `No reviewers could be auto-derived (no CODEOWNERS/decision/owner match) -- ask the user who should review this plan, then POST /api/plans/${planId}/reviews/request {from:["login", ...]}.`;
+    } else if (outcome.requested) {
+      statusNote = 'Review request(s) were just sent.';
+    } else {
+      statusNote = `${rg.openAtCurrentHash} open request(s) already pending.`;
+    }
+    return `Architect: plan is clean (planId ${planId}) but awaiting reviewer approval (${rg.have}/${rg.requiredApprovals || rg.openAtCurrentHash || 1} approved, mode ${rg.mode}). ${statusNote} Poll \`GET /api/plans/${planId}/gate-status?wait=25&since=${fingerprint}\` until \`reviewGate.satisfied\` is true, then retry ExitPlanMode. Never approve your own plan.`;
+  }
+  // Anything else is a real gap in this classification -- name the kind
+  // explicitly rather than folding it into a generic message that would hide
+  // which branch was actually hit (V11 plugin P2).
+  return `Architect returned an unexpected error (kind: ${outcome.kind}${outcome.detail ? `, detail: ${outcome.detail}` : ''}) -- export ARCHITECT_GATE=warn to bypass while this is investigated.`;
 }
 
 // ---- Marker-file fallback protocol (used when tool_input carries no plan text) ----
@@ -213,7 +344,12 @@ export function readFreshMarker(keys, { sessionId, cwd } = {}, maxAgeMs = 15 * 6
     } catch {
       continue;
     }
-    if (Date.now() - Date.parse(marker.checkedAt) > maxAgeMs) continue;
+    // Bug fix (V11 plugin P1): Date.parse on a missing/malformed checkedAt
+    // returns NaN, and `Date.now() - NaN` is NaN, which fails a `> maxAgeMs`
+    // comparison silently -- a corrupt or hand-edited marker used to read as
+    // "fresh" instead of being rejected. Require a finite age explicitly.
+    const age = Date.now() - Date.parse(marker.checkedAt);
+    if (!Number.isFinite(age) || age > maxAgeMs) continue;
     if (sessionId && marker.sessionId === sessionId) return marker;
     if (cwd && marker.cwd === cwd) return marker;
   }

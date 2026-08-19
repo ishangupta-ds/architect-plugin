@@ -6,7 +6,7 @@
 // directly, check it inline; otherwise fall back to a session-scoped marker file
 // written by architect-submit.mjs (the skill instructs Claude to run that first
 // when the primary path yields no text).
-import { candidateMarkerKeys, deriveSessionPlanId, formatReason, log, markerDir, readFreshMarker, readStdinJson, resolveConfig, submitAndCheck } from './architect-lib.mjs';
+import { candidateMarkerKeys, checkApprovalGate, classifyResult, decideAllow, deriveSessionPlanId, formatReason, log, markerDir, readFreshMarker, readStdinJson, resolveConfig, submitAndCheck } from './architect-lib.mjs';
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -33,10 +33,15 @@ async function runPost(input) {
   }
 }
 
-function decideAllow(mode, kind) {
-  if (kind === 'clean' || kind === 'server-unconfigured') return true;
-  if (mode !== 'enforce') return true; // warn/off: never actually block
-  return false; // enforce + blocked/network/bad-plan/other-error: deny
+/** V11 plugin P3: after a clean/waived base outcome, when the mode is
+ * `enforce-approvals`, additionally consult the live review-approval gate and
+ * let it override the outcome (clean -> approved/awaiting-approval/
+ * gate-status-unavailable/network). Every other mode, and every non-clean base
+ * outcome, passes through completely unchanged -- this is the one place that
+ * behavior differs from plain `enforce`, and it's opt-in only. */
+async function finalizeOutcome(config, planId, baseOutcome) {
+  if (baseOutcome.kind !== 'clean' || config.mode !== 'enforce-approvals') return baseOutcome;
+  return await checkApprovalGate(config, planId);
 }
 
 async function runPre(input) {
@@ -58,7 +63,7 @@ async function runPre(input) {
 
   if (inlinePlan) {
     const result = await submitAndCheck(config, { markdown: inlinePlan, planId });
-    handleResult(config, planId, result);
+    await handleResult(config, planId, result);
     return;
   }
 
@@ -67,7 +72,7 @@ async function runPre(input) {
   // was obtainable when it ran, cwd-keyed as the always-available fallback).
   const marker = readFreshMarker(candidateMarkerKeys({ sessionId, cwd }), { sessionId, cwd });
   if (!marker) {
-    if (config.mode === 'enforce') {
+    if (config.mode === 'enforce' || config.mode === 'enforce-approvals') {
       emit('deny', `No fresh Architect check found for this session (planId ${planId}) -- run \`architect-submit.mjs <plan-file>\` on your plan first, then retry. Or export ARCHITECT_GATE=warn to bypass while investigating.`);
     } else {
       emit('allow', `Architect: no plan text available to check (planId ${planId}) -- gate skipped in warn mode.`);
@@ -75,31 +80,34 @@ async function runPre(input) {
     return;
   }
 
-  const outcome = marker.verdict.blocked ? { kind: 'blocked', verdict: marker.verdict } : { kind: 'clean', verdict: marker.verdict };
+  const baseOutcome = marker.verdict.blocked ? { kind: 'blocked', verdict: marker.verdict } : { kind: 'clean', verdict: marker.verdict };
+  const resolvedPlanId = marker.planId ?? planId;
+  const outcome = await finalizeOutcome(config, resolvedPlanId, baseOutcome);
   const allow = decideAllow(config.mode, outcome.kind);
-  emit(allow ? 'allow' : 'deny', formatReason(config, marker.planId ?? planId, outcome));
+  emit(allow ? 'allow' : 'deny', formatReason(config, resolvedPlanId, outcome));
 }
 
-function handleResult(config, planId, result) {
+async function handleResult(config, planId, result) {
   if (result.network) {
     const outcome = { kind: 'network', detail: result.error };
     emit(decideAllow(config.mode, 'network') ? 'allow' : 'deny', formatReason(config, planId, outcome));
     return;
   }
   if (result.ok) {
-    const outcome = result.verdict.blocked ? { kind: 'blocked', verdict: result.verdict } : { kind: 'clean', verdict: result.verdict };
+    const resolvedPlanId = result.planId ?? planId;
+    const baseOutcome = result.verdict.blocked ? { kind: 'blocked', verdict: result.verdict } : { kind: 'clean', verdict: result.verdict };
+    const outcome = await finalizeOutcome(config, resolvedPlanId, baseOutcome);
     const allow = decideAllow(config.mode, outcome.kind);
-    emit(allow ? 'allow' : 'deny', formatReason(config, result.planId ?? planId, outcome));
+    emit(allow ? 'allow' : 'deny', formatReason(config, resolvedPlanId, outcome));
     return;
   }
-  // Non-2xx HTTP response from compile/check/waivers.
+  // Non-2xx HTTP response from compile/check/waivers. classifyResult is the ONE
+  // place this classification table lives (V11 plugin P2 -- this used to be a
+  // second, hand-duplicated copy of architect-lib.mjs's own table, which could
+  // silently drift from it).
   const code = result.json?.error;
   const detail = `${result.stage} returned ${result.status}${code ? ` ${code}` : ''}`;
-  let kind = 'other-error';
-  if (result.status === 503 && code === 'PLANNER_UNAVAILABLE') kind = 'server-unconfigured';
-  else if (result.status === 400 && code === 'NO_CODE_SNAPSHOT') kind = 'server-unconfigured';
-  else if (result.status === 400 && code === 'INVALID_FRONTMATTER') kind = 'bad-plan';
-  else if (result.status === 502 && code === 'PLANNER_CALL_FAILED') kind = 'bad-plan';
+  const kind = classifyResult(result);
   emit(decideAllow(config.mode, kind) ? 'allow' : 'deny', formatReason(config, planId, { kind, detail }));
 }
 
