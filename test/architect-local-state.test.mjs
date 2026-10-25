@@ -141,7 +141,10 @@ describe('throttled', () => {
     assert.ok(THROTTLE_MS >= 10_000);
   });
   test('an unwritable state directory means no throttling, not an error', () => {
-    assert.equal(throttled('/repo/c', Date.now(), { CLAUDE_PLUGIN_DATA: '/proc/definitely/not/writable' }), false);
+    // a "directory" below a regular file can never be created (ENOTDIR) on any OS, and fails at once -- unlike a path under /proc, where a recursive mkdir can spin on Linux
+    const file = join(mkdtempSync(join(tmpdir(), 'plugin-notdir-')), 'plain-file');
+    writeFileSync(file, 'x');
+    assert.equal(throttled('/repo/c', Date.now(), { CLAUDE_PLUGIN_DATA: join(file, 'below') }), false);
   });
 });
 
