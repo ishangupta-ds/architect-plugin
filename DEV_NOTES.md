@@ -78,3 +78,17 @@ session to resolve. If real-world latency ever gets uncomfortably close to the h
 ceiling, the fix is almost certainly parallelizing `fetchGateStatus`'s eventual
 poll retries client-side (the plugin itself never long-polls; each `ExitPlanMode`
 retry is one fresh, fast round trip), not raising these per-call timeouts.
+
+## 4. Local state: the generated core and the contract fixture
+
+`bin/local-state-core.mjs` is NOT hand-written: it is the architect repo's collector + publisher (`src/server/local-state`) bundled into one dependency-free file by
+`pnpm build:plugin-bundle` there (committed as `plugin-dist/local-state-core.mjs`; architect's own tests fail if that copy is stale). `test/fixtures/local-state-contract.json`
+is the shared publish contract the server validates against. The bundle's header records the sha256 of the fixture it was built with; `node bin/validate.mjs` and the tests
+fail if the two copies here disagree. **To update**: change the source in the architect repo, run `pnpm build:plugin-bundle` there, copy `plugin-dist/local-state-core.mjs`
+to `bin/` and `src/shared/fixtures/local-state-contract.json` to `test/fixtures/` here, run `node --test`, bump the version.
+
+The wrapper `bin/architect-local-state.mjs` is hand-written and deliberately minimal: it needs `ARCHITECT_LOCAL_STATE=on`, `ARCHITECT_URL` and an `architect_ls_` token in
+`ARCHITECT_LOCAL_STATE_TOKEN` (a full token is refused, and is never passed to the worker); it returns at once and a detached worker (given only that token, the URL,
+the workspace, the exclude list, PATH/HOME and the plugin data dir) does the work; a 30 s per-checkout throttle stops SessionStart and the ExitPlanMode hook from publishing twice in a row.
+Nothing is printed (SessionStart stdout would enter Claude's context; PreToolUse stdout is the gate's JSON) and every failure exits 0.
+

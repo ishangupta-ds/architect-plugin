@@ -2,6 +2,7 @@
 // Cheap, dependency-free sanity check for this plugin's manifests + scripts.
 // Run via `node bin/validate.mjs` or the CI workflow. Catches the common
 // shipping breaks: malformed JSON, and a bin script with a syntax error.
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -38,8 +39,23 @@ checkJson('.claude-plugin/marketplace.json');
 checkJson('.mcp.json');
 checkJson('hooks/hooks.json');
 
-for (const script of ['bin/architect-lib.mjs', 'bin/architect-gate.mjs', 'bin/architect-submit.mjs', 'bin/architect-session-start.mjs', 'bin/validate.mjs']) {
+for (const script of ['bin/architect-lib.mjs', 'bin/architect-gate.mjs', 'bin/architect-submit.mjs', 'bin/architect-session-start.mjs', 'bin/architect-local-state.mjs', 'bin/local-state-core.mjs', 'bin/validate.mjs']) {
   checkScript(script);
+}
+
+// The bundled collector and the contract fixture copy must be the pair the architect repo built together (see DEV_NOTES.md, "Local state").
+try {
+  const header = readFileSync(join(root, 'bin/local-state-core.mjs'), 'utf8').split('\n').slice(0, 3).join('\n');
+  const recorded = header.match(/contract-fixture-sha256: ([0-9a-f]{64})/)?.[1];
+  const actual = createHash('sha256').update(readFileSync(join(root, 'test/fixtures/local-state-contract.json'))).digest('hex');
+  if (recorded === actual) console.log('ok   local-state bundle matches its contract fixture');
+  else {
+    failed = true;
+    console.error('FAIL bin/local-state-core.mjs was built against a different contract fixture than test/fixtures/local-state-contract.json: copy BOTH from the architect repo (pnpm build:plugin-bundle).');
+  }
+} catch (err) {
+  failed = true;
+  console.error(`FAIL local-state bundle check: ${err instanceof Error ? err.message : String(err)}`);
 }
 
 if (failed) {

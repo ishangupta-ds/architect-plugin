@@ -60,6 +60,31 @@ reached by default in either case — you must set `ARCHITECT_GATE=enforce-appro
 explicitly, since it changes the loop (a plan can now sit "awaiting approval" even
 with zero violations) in a way plain `enforce` never does.
 
+## Sharing local state with teammates (optional, off by default)
+
+If you and your teammates use Architect's reviewer context, the plugin can tell the server **which files you have changed locally but not pushed**, so a reviewer
+reading a plan sees "alice has uncommitted changes to 2 of the files this plan touches". It is a **double opt-in**, shares **file names only** (never contents or diffs),
+and a teammate only ever sees the files that overlap the plan they are looking at.
+
+1. **Opt in on the server**, from a signed-in browser session: `PUT /api/local-state/consent {"enabled": true}` for your workspace (the operator must have enabled
+   `LOCAL_STATE`). Withdrawing (`{"enabled": false}`) deletes everything you shared.
+2. **Mint a scoped token** -- it is bound to one workspace, expires (30 days by default) and can do nothing except publish local state:
+   `pnpm auth:token -- --login <you> --label laptop --scope local-state --workspace <id>` (or `POST /api/auth/local-state-tokens` from a session).
+3. **Turn it on here**, in your shell profile:
+   ```bash
+   export ARCHITECT_LOCAL_STATE=on
+   export ARCHITECT_LOCAL_STATE_TOKEN=architect_ls_...      # the scoped token; your ARCHITECT_TOKEN is never used for this
+   export ARCHITECT_WORKSPACE=<workspace-id>                  # optional; the token already names its workspace
+   export ARCHITECT_LOCAL_STATE_EXCLUDE='docs/**,*.md'        # optional extra exclusions (comma-separated globs)
+   ```
+
+What happens: at session start and just before `ExitPlanMode`, a detached worker reads your checkout with **read-only git** (no fetch, nothing written, your index
+untouched) and sends the branch, `HEAD`, how far you are ahead/behind origin's default branch (as of your last fetch), whether tracked files have uncommitted
+changes, and the **names** of files changed relative to the default branch. Files named like credentials (`.env*`, `*.pem`, `id_rsa*`, `secrets/`, ...) are never listed.
+The hook returns immediately, prints nothing, and never fails a session: if the server says no (no consent yet, repo not registered, rate limited ...) it is silent.
+To see why nothing arrives, look at `${CLAUDE_PLUGIN_DATA:-~/.architect-plugin-data}/local-state/*.last.json` (an exit code and one line; never your token or file names).
+To preview exactly what would be sent, run the server repo's `pnpm local-state:publish -- --dry-run`. Shared lists expire after 24 hours.
+
 ## Repo layout
 
 - `bin/architect-lib.mjs` — shared HTTP client, verdict computation, marker
@@ -69,6 +94,7 @@ with zero violations) in a way plain `enforce` never does.
   for the fallback path, and useful on its own to check a plan file before
   drafting it in-conversation.
 - `bin/architect-session-start.mjs` — the `SessionStart` context banner.
+- `bin/architect-local-state.mjs` — the optional local-state hook (above); `bin/local-state-core.mjs` is its collector, **generated** from the architect repo (do not edit; see `DEV_NOTES.md`).
 - `skills/architect-workflow/SKILL.md` — the workflow guidance Claude reads.
 - `.mcp.json` — bundles Architect's remote MCP server (the tool-calling surface
   the skill prefers over the raw REST API).
